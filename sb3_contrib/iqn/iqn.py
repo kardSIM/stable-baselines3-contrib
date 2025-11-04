@@ -214,7 +214,7 @@ class IQN(OffPolicyAlgorithm):
                 target_quantiles = replay_data.rewards + (1 - replay_data.dones) * discounts * next_quantiles
 
             # Get current quantile estimates
-            current_quantiles = self.quantile_net(replay_data.observations,self.n_sample)
+            current_quantiles, taus = self.quantile_net(replay_data.observations,self.n_sample,return_taus=True)
 
             # Make "n_quantiles" copies of actions, and reshape to (batch_size, n_quantiles, 1).
             actions = replay_data.actions[..., None].long().expand(batch_size, self.n_sample, 1)
@@ -222,7 +222,7 @@ class IQN(OffPolicyAlgorithm):
             current_quantiles = th.gather(current_quantiles, dim=2, index=actions).squeeze(dim=2)
 
             # Compute Quantile Huber loss, summing over a quantile dimension as in the paper.
-            loss = quantile_huber_loss(current_quantiles, target_quantiles, sum_over_quantiles=True)
+            loss = quantile_huber_loss(current_quantiles, target_quantiles, cum_prob=taus.unsqueeze(-1), sum_over_quantiles=True)
             losses.append(loss.item())
 
             # Optimize the policy

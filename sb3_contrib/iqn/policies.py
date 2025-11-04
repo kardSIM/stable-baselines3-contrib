@@ -99,7 +99,7 @@ class ImplicitQuantileNetwork(BasePolicy):
             nn.ReLU(),
             nn.Linear(self.net_arch[-1], action_dim),)
         
-    def forward(self, obs: PyTorchObs, sample_size: int=32) -> th.Tensor:
+    def forward(self, obs: PyTorchObs, sample_size: int=32,return_taus=False) -> th.Tensor:
         """
         Predict the quantiles.
 
@@ -122,6 +122,9 @@ class ImplicitQuantileNetwork(BasePolicy):
         # element-wise product
         quantiles = state_features.unsqueeze(1) * tau_embedding  
         quantiles = self.projection(quantiles.view(batch_size * sample_size, -1))
+        if return_taus:
+            return quantiles.view(batch_size, sample_size, int(self.action_space.n)), taus
+        
         return quantiles.view(batch_size, sample_size, int(self.action_space.n))
 
     def _predict(self, observation: PyTorchObs, sample_size: int, deterministic: bool = True) -> th.Tensor:
