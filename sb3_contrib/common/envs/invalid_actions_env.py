@@ -1,5 +1,3 @@
-from typing import Optional
-
 import numpy as np
 from gymnasium import spaces
 from stable_baselines3.common.envs import IdentityEnv
@@ -12,7 +10,7 @@ class InvalidActionEnvDiscrete(IdentityEnv[int]):
 
     def __init__(
         self,
-        dim: Optional[int] = None,
+        dim: int | None = None,
         ep_length: int = 100,
         n_invalid_actions: int = 0,
     ):
@@ -20,7 +18,7 @@ class InvalidActionEnvDiscrete(IdentityEnv[int]):
             dim = 1
         assert n_invalid_actions < dim, f"Too many invalid actions: {n_invalid_actions} < {dim}"
 
-        space = spaces.Discrete(dim)
+        space = spaces.Discrete(dim)  # type: ignore[var-annotated]
         self.n_invalid_actions = n_invalid_actions
         self.possible_actions = np.arange(space.n, dtype=int)
         self.invalid_actions: list[int] = []
@@ -47,7 +45,7 @@ class InvalidActionEnvMultiDiscrete(IdentityEnv[np.ndarray]):
 
     def __init__(
         self,
-        dims: Optional[list[int]] = None,
+        dims: list[int] | None = None,
         ep_length: int = 100,
         n_invalid_actions: int = 0,
     ):
@@ -89,7 +87,7 @@ class InvalidActionEnvMultiBinary(IdentityEnv[np.ndarray]):
 
     def __init__(
         self,
-        dims: Optional[int] = None,
+        dims: int | None = None,
         ep_length: int = 100,
         n_invalid_actions: int = 0,
     ):
