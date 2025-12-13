@@ -10,7 +10,7 @@ from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import LinearSchedule, get_parameters_by_name, polyak_update
 
-from sb3_contrib.common.utils import quantile_huber_loss
+from sb3_contrib.common.utils import quantile_huber_loss, calc_fraction_loss
 from sb3_contrib.fqf.policies import CnnPolicy, MlpPolicy, MultiInputPolicy, FQFPolicy, FullyparameterizedQuantileNetwork
 
 SelfFQF = TypeVar("SelfFQF", bound="FQF")
@@ -194,7 +194,8 @@ class FQF(OffPolicyAlgorithm):
         # Update learning rate according to schedule
         self._update_learning_rate(self.policy.optimizer)
 
-        losses = []
+        quantile_losses = []
+        fraction_losses = []
         for _ in range(gradient_steps):
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
@@ -204,7 +205,7 @@ class FQF(OffPolicyAlgorithm):
             with th.no_grad():
                 # Compute the quantiles of next observation
                 next_quantiles, next_taus, _, _ = self.quantile_net_target.forward(
-                    replay_data.next_observations, return_fractions=True
+                    replay_data.next_observations
                 )       
                 next_q_values = ((next_taus[:, 1:, None] - next_taus[:, :-1, None]) * next_quantiles).sum(dim=1)
          
@@ -218,26 +219,38 @@ class FQF(OffPolicyAlgorithm):
                 target_quantiles = replay_data.rewards + (1 - replay_data.dones) * discounts * next_quantiles
 
             # Get current quantile estimates
-            current_quantiles, current_taus, current_tau_hats, entropies = self.quantile_net.forward(
-                replay_data.observations, return_fractions=True
+            current_quantiles, current_taus, current_tau_hats, entropies, bounded_quantiles = self.quantile_net.forward(
+                replay_data.observations, return_bounded_quantiles=True
             )
-            # Make "n_quantiles" copies of actions, and reshape to (batch_size, n_quantiles, 1).
-            actions = replay_data.actions[..., None].long().expand(batch_size, self.n_quantiles, 1)
+            # Make "n_quantiles" copies of actions, and reshape to (batch_size, n_quantiles, 1)
+            actions = replay_data.actions[..., None].long()
             # Retrieve the quantiles for the actions from the replay buffer
-            current_quantiles = th.gather(current_quantiles, dim=2, index=actions).squeeze(dim=2)
+            current_quantiles = th.gather(current_quantiles, dim=2, index=actions.expand(batch_size, self.n_quantiles, 1)).squeeze(dim=2)
+            bounded_quantiles = th.gather(bounded_quantiles, dim=2, index=actions.expand(batch_size, self.n_quantiles-1, 1)).squeeze(dim=2)
 
-            # Compute Quantile Huber loss, summing over a quantile dimension as in the paper.
-            quantile_loss = quantile_huber_loss(current_quantiles, target_quantiles, 
-                    cum_prob=current_tau_hats.unsqueeze(-1),
-                    sum_over_quantiles=True
-                )
-            entropy_loss = -entropies.mean() 
-            loss = quantile_loss + self.entropy_coef * entropy_loss
-            losses.append(loss.item())
+
+
+            frac_loss = calc_fraction_loss(current_quantiles.detach(), bounded_quantiles.detach(), current_taus)
+            entropy_loss = -entropies.mean()
+            frac_loss +=  self.entropy_coef * entropy_loss   
+            
+            # Compute Quantile Huber loss, summing over a quantile dimension
+            quantile_loss = quantile_huber_loss(
+                current_quantiles, target_quantiles, 
+                cum_prob=current_tau_hats.unsqueeze(-1),
+                sum_over_quantiles=True
+            )
+
+            quantile_losses.append(quantile_loss.item())
+            fraction_losses.append(frac_loss.item())
+
+            self.policy.fraction_optimizer.zero_grad()
+            frac_loss.backward(retain_graph=True)
+            self.policy.fraction_optimizer.step()
 
             # Optimize the policy
             self.policy.optimizer.zero_grad()
-            loss.backward()
+            quantile_loss.backward()
             # Clip gradient norm
             if self.max_grad_norm is not None:
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
@@ -247,7 +260,8 @@ class FQF(OffPolicyAlgorithm):
         self._n_updates += gradient_steps
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/loss", np.mean(losses))
+        self.logger.record("train/quantile_loss", np.mean(quantile_losses))
+        self.logger.record("train/fraction_loss", np.mean(fraction_losses))
 
     def predict(
         self,
@@ -304,6 +318,6 @@ class FQF(OffPolicyAlgorithm):
         return super()._excluded_save_params() + ["quantile_net", "quantile_net_target"]  # noqa: RUF005
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
-        state_dicts = ["policy", "policy.optimizer"]
+        state_dicts = ["policy", "policy.optimizer", "policy.fraction_optimizer"]
 
         return state_dicts, []

@@ -15,6 +15,8 @@ from torch import nn
 import torch.nn.functional as F
 import numpy as np
 
+from torch.optim import RMSprop
+
 def initialize_weights_xavier(m, gain=1.0):
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
         th.nn.init.xavier_uniform_(m.weight, gain=gain)
@@ -163,7 +165,21 @@ class FullyparameterizedQuantileNetwork(BasePolicy):
             nn.Linear(self.net_arch[-1], action_dim),)
         
 
-    def forward(self, obs: PyTorchObs, return_fractions: bool = False) -> th.Tensor:
+    def compute_distribution_quantiles(self, state_features: PyTorchObs,tau_hats, n_quantiles) -> th.Tensor:
+        
+        batch_size = state_features.shape[0]
+        tau_embedding = self.embed_model(tau_hats)
+
+        # element-wise product
+        quantiles = state_features.unsqueeze(1) * tau_embedding  
+
+
+        # Calculate quantile values
+        quantiles = self.projection(quantiles)
+        quantiles= quantiles.view(batch_size, n_quantiles, int(self.action_space.n))
+        return quantiles
+
+    def forward(self, obs: PyTorchObs, return_bounded_quantiles: bool= False) -> th.Tensor:
         """
         Predict the quantiles.
 
@@ -171,23 +187,18 @@ class FullyparameterizedQuantileNetwork(BasePolicy):
         :return: The estimated quantiles for each action.
         """
         state_features = self.mlp_net(self.extract_features(obs, self.features_extractor))
-        batch_size = state_features.shape[0]
-        taus, tau_hats, entropies = self.fraction_net(state_features)
+        taus, tau_hats, entropies = self.fraction_net(state_features.detach())
         
-        tau_embedding = self.embed_model(tau_hats)
+        quantiles=self.compute_distribution_quantiles(state_features, tau_hats, self.n_quantiles)
 
-        # element-wise product
-        quantiles = state_features.unsqueeze(1) * tau_embedding  
-        quantiles = self.projection(quantiles.view(batch_size * self.n_quantiles, -1))
-        quantiles= quantiles.view(batch_size, self.n_quantiles, int(self.action_space.n))
-
-        if return_fractions:
-            return quantiles, taus, tau_hats, entropies
-        return quantiles
+        if return_bounded_quantiles:
+            bounded_quantiles=self.compute_distribution_quantiles(state_features, taus[:, 1:-1], self.n_quantiles-1)
+            return quantiles, taus, tau_hats, entropies, bounded_quantiles
+        return quantiles, taus, tau_hats, entropies
 
     def calculate_q(self, obs: PyTorchObs) -> th.Tensor:
 
-        quantiles, taus, tau_hats, _ = self.forward(obs, return_fractions=True)
+        quantiles, taus, _, _ = self.forward(obs)
         batch_size = quantiles.shape[0]
         q_values = ((taus[:, 1:, None] - taus[:, :-1, None]) * quantiles).sum(dim=1) 
         assert q_values.shape == (batch_size, int(self.action_space.n))
@@ -224,7 +235,8 @@ class FQFPolicy(BasePolicy):
     :param lr_schedule: Learning rate schedule (could be constant)
     :param n_quantiles: Number of quantiles
     :param num_cosines: Number of cosine embedding 
-    :param entropy_coef: if > 0 use entropy as a regularization term 
+    :param fraction_lr: lr of the  FractionProposalNetwork
+    :param entropy_coef: if > 0 use entropy as a regularization term in fraction loss
     :param net_arch: The specification of the network architecture.
     :param activation_fn: Activation function
     :param features_extractor_class: Features extractor to use.
@@ -248,7 +260,8 @@ class FQFPolicy(BasePolicy):
         lr_schedule: Schedule,
         n_quantiles: int = 32,
         num_cosines: int = 64,
-        entropy_coef: float = 0.0,
+        fraction_lr: float = 2.5e-9, 
+        entropy_coef: float = 0.001,
         net_arch: Optional[list[int]] = None,
         activation_fn: type[nn.Module] = nn.ReLU,
         features_extractor_class: type[BaseFeaturesExtractor] = FlattenExtractor,
@@ -275,6 +288,7 @@ class FQFPolicy(BasePolicy):
 
         self.n_quantiles = n_quantiles
         self.num_cosines = num_cosines
+        self.fraction_lr = fraction_lr
         self.entropy_coef = entropy_coef
         self.net_arch = net_arch
         self.activation_fn = activation_fn
@@ -292,7 +306,7 @@ class FQFPolicy(BasePolicy):
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
-        Create the network and the optimizer.
+        Create the network and the optimizers.
 
         :param lr_schedule: Learning rate schedule
             lr_schedule(1) is the initial learning rate
@@ -302,12 +316,22 @@ class FQFPolicy(BasePolicy):
         self.quantile_net_target.load_state_dict(self.quantile_net.state_dict())
         self.quantile_net_target.set_training_mode(False)
 
-        # Setup optimizer with initial learning rate
+        excluded_params = set(self.quantile_net.fraction_net.parameters())
+        quantile_params = [
+            p for p in self.quantile_net.parameters() if p not in excluded_params
+        ]
+        
         self.optimizer = self.optimizer_class(  # type: ignore[call-arg]
-            self.quantile_net.parameters(),
+            quantile_params,
             lr=lr_schedule(1),
             **self.optimizer_kwargs,
         )
+
+        self.fraction_optimizer = RMSprop(
+            self.quantile_net.fraction_net.parameters(),
+            lr=self.fraction_lr, 
+            alpha=0.95, 
+            eps=0.00001)
 
     def make_quantile_net(self) -> FullyparameterizedQuantileNetwork:
         # Make sure we always have separate networks for features extractors etc
@@ -328,6 +352,8 @@ class FQFPolicy(BasePolicy):
                 n_quantiles=self.net_args["n_quantiles"],
                 num_cosines=self.net_args["num_cosines"],
                 net_arch=self.net_args["net_arch"],
+                fraction_lr=self.fraction_lr,
+                entropy_coef=self.entropy_coef,
                 activation_fn=self.net_args["activation_fn"],
                 lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
                 optimizer_class=self.optimizer_class,
@@ -360,7 +386,8 @@ class CnnPolicy(FQFPolicy):
     :param lr_schedule: Learning rate schedule (could be constant)
     :param n_quantiles: Number of quantiles
     :param num_cosines: Number of cosine embedding 
-    :param entropy_coef: if > 0 use entropy as a regularization term 
+    :param fraction_lr: lr of the  FractionProposalNetwork
+    :param entropy_coef: if > 0 use entropy as a regularization term in fraction loss
     :param net_arch: The specification of the network architecture.
     :param activation_fn: Activation function
     :param features_extractor_class: Features extractor to use.
@@ -379,6 +406,7 @@ class CnnPolicy(FQFPolicy):
         lr_schedule: Schedule,
         n_quantiles: int = 32,
         num_cosines: int = 64,
+        fraction_lr: float = 2.5e-9, 
         entropy_coef: float = 0.0,
         net_arch: Optional[list[int]] = None,
         activation_fn: type[nn.Module] = nn.ReLU,
@@ -394,6 +422,7 @@ class CnnPolicy(FQFPolicy):
             lr_schedule,
             n_quantiles,
             num_cosines,
+            fraction_lr,
             entropy_coef,
             net_arch,
             activation_fn,
@@ -414,7 +443,8 @@ class MultiInputPolicy(FQFPolicy):
     :param lr_schedule: Learning rate schedule (could be constant)
     :param n_quantiles: Number of quantiles
     :param num_cosines: Number of cosine embedding 
-    :param entropy_coef: if > 0 use entropy as a regularization term 
+    :param fraction_lr: lr of the  FractionProposalNetwork
+    :param entropy_coef: if > 0 use entropy as a regularization term in fraction loss 
     :param net_arch: The specification of the network architecture.
     :param activation_fn: Activation function
     :param features_extractor_class: Features extractor to use.
@@ -433,6 +463,7 @@ class MultiInputPolicy(FQFPolicy):
         lr_schedule: Schedule,
         n_quantiles: int = 32,
         num_cosines: int = 64,
+        fraction_lr: float = 2.5e-9, 
         entropy_coef: float = 0.0,
         net_arch: Optional[list[int]] = None,
         activation_fn: type[nn.Module] = nn.ReLU,
@@ -448,6 +479,7 @@ class MultiInputPolicy(FQFPolicy):
             lr_schedule,
             n_quantiles,
             num_cosines,
+            fraction_lr,
             entropy_coef,
             net_arch,
             activation_fn,

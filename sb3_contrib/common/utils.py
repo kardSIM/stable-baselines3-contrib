@@ -70,6 +70,25 @@ def quantile_huber_loss(
     return loss
 
 
+def calc_fraction_loss(FZ_,FZ, taus, weights=None):
+    """calculate the loss for the fraction proposal network """
+    
+    gradients1 = FZ - FZ_[:, :-1]
+    gradients2 = FZ - FZ_[:, 1:] 
+    flag_1 = FZ > th.cat([FZ_[:, :1], FZ[:, :-1]], dim=1)
+    flag_2 = FZ < th.cat([FZ[:, 1:], FZ_[:, -1:]], dim=1)
+    gradients = (th.where(flag_1, gradients1, - gradients1) + th.where(flag_2, gradients2, -gradients2)).view(FZ.shape[0], FZ.shape[1])
+
+    if weights is not None:
+        fraction_loss = ((
+            (gradients * taus[:, 1:-1]).sum(dim=1, keepdim=True)
+        ) * weights).mean()
+    else:
+        fraction_loss = \
+            (gradients * taus[:, 1:-1]).sum(dim=1).mean()
+    return fraction_loss
+    
+
 def conjugate_gradient_solver(
     matrix_vector_dot_fn: Callable[[th.Tensor], th.Tensor],
     b,
